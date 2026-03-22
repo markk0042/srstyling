@@ -111,10 +111,9 @@ export function Configurator() {
           </div>
         </div>
         <p className="config-hint">
-          Best quality: download the GLB from Sketchfab (BMW M3 Sedan 2013) and
-          save it as <code>public/models/bmw-m3/model.glb</code>. The viewer
-          uses that file automatically; if it is missing, it falls back to the
-          bundled OBJ. Add-on parts are placeholder geometry for layout.
+          The car is loaded from <code>public/models/bmw-m3/bmw3.glb</code>{' '}
+          (Blender export). Replace that file to update the 3D model. Add-on
+          parts are placeholder geometry for layout.
         </p>
       </aside>
     </div>
