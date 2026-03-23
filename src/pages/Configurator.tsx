@@ -2,6 +2,7 @@ import { Canvas } from '@react-three/fiber'
 import { useMemo, useState } from 'react'
 import {
   BMWScene,
+  SPOILER_OPTIONS,
   type ModFlags,
 } from '../components/configurator/BMWScene'
 
@@ -23,17 +24,17 @@ const vehicles = [
   },
 ] as const
 
-const modList: { key: keyof ModFlags; label: string }[] = [
-  { key: 'spoiler', label: 'Rear spoiler' },
-  { key: 'frontLip', label: 'Front lip' },
-  { key: 'sideSkirts', label: 'Side skirts' },
-  { key: 'rearDiffuser', label: 'Rear diffuser' },
-]
+const modList: { key: Exclude<keyof ModFlags, 'spoiler'>; label: string }[] =
+  [
+    { key: 'frontLip', label: 'Front lip' },
+    { key: 'sideSkirts', label: 'Side skirts' },
+    { key: 'rearDiffuser', label: 'Rear diffuser' },
+  ]
 
 export function Configurator() {
   const [vehicleId, setVehicleId] = useState<string>('bmw-m3')
   const [mods, setMods] = useState<ModFlags>({
-    spoiler: false,
+    spoiler: 'none',
     frontLip: false,
     sideSkirts: false,
     rearDiffuser: false,
@@ -46,7 +47,7 @@ export function Configurator() {
 
   const showScene = selected?.available === true
 
-  function toggleMod(key: keyof ModFlags) {
+  function toggleMod(key: Exclude<keyof ModFlags, 'spoiler'>) {
     setMods((m) => ({ ...m, [key]: !m[key] }))
   }
 
@@ -95,7 +96,28 @@ export function Configurator() {
           </select>
         </div>
         <div>
-          <span className="field-label">Styling parts</span>
+          <span className="field-label">Rear spoiler</span>
+          <select
+            className="select"
+            value={mods.spoiler}
+            onChange={(e) =>
+              setMods((m) => ({
+                ...m,
+                spoiler: e.target.value as ModFlags['spoiler'],
+              }))
+            }
+            disabled={!showScene}
+            aria-label="Rear spoiler option"
+          >
+            {SPOILER_OPTIONS.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <span className="field-label">Other styling parts</span>
           <div className="mod-grid">
             {modList.map(({ key, label }) => (
               <label key={key} className="mod-option">
@@ -111,9 +133,9 @@ export function Configurator() {
           </div>
         </div>
         <p className="config-hint">
-          The car is loaded from <code>public/models/bmw-m3/bmw3.glb</code>{' '}
-          (Blender export). Replace that file to update the 3D model. Add-on
-          parts are placeholder geometry for layout.
+          Car: <code>public/models/bmw-m3/bmw3.glb</code>. Universal spoiler:{' '}
+          <code>public/models/parts/universal-spoiler-2.glb</code>. Adjust
+          position in code if it does not sit flush on your body.
         </p>
       </aside>
     </div>

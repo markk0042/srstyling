@@ -6,11 +6,13 @@ import {
   useGLTF,
 } from '@react-three/drei'
 import { useFrame } from '@react-three/fiber'
-import { Suspense, useMemo, useRef } from 'react'
+import { Suspense, useEffect, useMemo, useRef } from 'react'
 import * as THREE from 'three'
 
+export type SpoilerChoice = 'none' | 'universal-spoiler-2'
+
 export type ModFlags = {
-  spoiler: boolean
+  spoiler: SpoilerChoice
   frontLip: boolean
   sideSkirts: boolean
   rearDiffuser: boolean
@@ -18,6 +20,14 @@ export type ModFlags = {
 
 /** Blender export — place file at `public/models/bmw-m3/bmw3.glb` */
 export const GLB_URL = '/models/bmw-m3/bmw3.glb'
+
+/** Universal rear spoiler add-on */
+export const SPOILER_UNIVERSAL_URL = '/models/parts/universal-spoiler-2.glb'
+
+export const SPOILER_OPTIONS: { id: SpoilerChoice; label: string }[] = [
+  { id: 'none', label: 'No spoiler' },
+  { id: 'universal-spoiler-2', label: 'Universal spoiler (rear)' },
+]
 
 const carbon = (
   <meshStandardMaterial
@@ -170,14 +180,206 @@ function prepareGlbMesh(root: THREE.Object3D) {
   })
 }
 
-function ModParts({ flags }: { flags: ModFlags }) {
+const _tmpV = new THREE.Vector3()
+const _meshToRoot = new THREE.Matrix4()
+
+/**
+ * `Box3.setFromObject` traverses LOD / helpers and can throw when a child ref is
+ * undefined. This builds an AABB from mesh vertices only, in `root` local space.
+ */
+function boundingBoxRootLocal(root: THREE.Object3D): THREE.Box3 {
+  root.updateMatrixWorld(true)
+  const invRoot = new THREE.Matrix4().copy(root.matrixWorld).invert()
+  const box = new THREE.Box3()
+  let verts = 0
+  root.traverse((child) => {
+    if (!(child instanceof THREE.Mesh) || !child.geometry) return
+    const pos = child.geometry.attributes.position
+    if (!pos) return
+    child.updateMatrixWorld(true)
+    _meshToRoot.copy(invRoot).multiply(child.matrixWorld)
+    for (let i = 0; i < pos.count; i++) {
+      _tmpV.fromBufferAttribute(pos, i).applyMatrix4(_meshToRoot)
+      box.expandByPoint(_tmpV)
+      verts++
+    }
+  })
+  if (verts === 0) {
+    box.setFromCenterAndSize(new THREE.Vector3(0, 0, 0), new THREE.Vector3(1, 1, 1))
+  }
+  return box
+}
+
+/**
+ * Casts a vertical ray in world space onto car meshes at the rear trunk / boot
+ * footprint, then returns the hit in car-root local space. This tracks the actual
+ * sheet metal instead of a loose vertex bbox.
+ */
+function raycastTrunkBootSurface(
+  carRoot: THREE.Object3D,
+  overall: THREE.Box3,
+): THREE.Vector3 | null {
+  const size = overall.getSize(new THREE.Vector3())
+  const maxZ = overall.max.z
+  const cx = (overall.min.x + overall.max.x) * 0.5
+  const yStart = overall.max.y + size.y * 0.85
+
+  carRoot.updateMatrixWorld(true)
+
+  const meshes: THREE.Mesh[] = []
+  carRoot.traverse((c) => {
+    if (c instanceof THREE.Mesh && c.geometry?.attributes?.position) meshes.push(c)
+  })
+  if (meshes.length === 0) return null
+
+  const zFracs = [0.09, 0.12, 0.15, 0.18, 0.22]
+  for (const frac of zFracs) {
+    const localOrigin = new THREE.Vector3(cx, yStart, maxZ - size.z * frac)
+    const worldOrigin = localOrigin.clone().applyMatrix4(carRoot.matrixWorld)
+    const raycaster = new THREE.Raycaster(
+      worldOrigin,
+      new THREE.Vector3(0, -1, 0),
+    )
+    const hits = raycaster.intersectObjects(meshes, false)
+    if (hits.length === 0) continue
+    const p = hits[0].point.clone()
+    carRoot.worldToLocal(p)
+    if (p.y < overall.min.y + size.y * 0.24) continue
+    p.y += size.y * 0.003
+    return p
+  }
+  return null
+}
+
+/**
+ * Fallback: sample vertices in a narrow rear “lid” band (not the full rear quarter).
+ */
+function computeTrunkAnchor(carRoot: THREE.Object3D, overall: THREE.Box3): THREE.Vector3 {
+  const fromRay = raycastTrunkBootSurface(carRoot, overall)
+  if (fromRay) return fromRay
+
+  carRoot.updateMatrixWorld(true)
+  const invRoot = new THREE.Matrix4().copy(carRoot.matrixWorld).invert()
+  const size = overall.getSize(new THREE.Vector3())
+  if (size.x < 1e-6 || size.y < 1e-6 || size.z < 1e-6) {
+    return overall.getCenter(new THREE.Vector3())
+  }
+
+  const maxZ = overall.max.z
+  const rearZMin = maxZ - size.z * 0.14
+  const yBodyLo = overall.min.y + size.y * 0.4
+  const yBodyHi = overall.min.y + size.y * 0.68
+
+  function collectTrunkBox(
+    zOnly: boolean,
+  ): { box: THREE.Box3; count: number } {
+    const trunkBox = new THREE.Box3()
+    let count = 0
+    carRoot.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return
+      const geom = child.geometry
+      if (!geom) return
+      const pos = geom.attributes.position
+      if (!pos) return
+      child.updateMatrixWorld(true)
+      _meshToRoot.copy(invRoot).multiply(child.matrixWorld)
+      for (let i = 0; i < pos.count; i++) {
+        _tmpV.fromBufferAttribute(pos, i).applyMatrix4(_meshToRoot)
+        if (_tmpV.z < rearZMin) continue
+        if (!zOnly && (_tmpV.y < yBodyLo || _tmpV.y > yBodyHi)) continue
+        trunkBox.expandByPoint(_tmpV)
+        count++
+      }
+    })
+    return { box: trunkBox, count }
+  }
+
+  let { box: trunkBox, count } = collectTrunkBox(false)
+  if (count < 40) {
+    const looser = collectTrunkBox(true)
+    if (looser.count > count) {
+      trunkBox = looser.box
+      count = looser.count
+    }
+  }
+
+  if (count < 1 || trunkBox.isEmpty()) {
+    const c = overall.getCenter(new THREE.Vector3())
+    return new THREE.Vector3(
+      c.x,
+      overall.min.y + size.y * 0.58,
+      overall.max.z - size.z * 0.08,
+    )
+  }
+
+  const anchor = new THREE.Vector3()
+  const sx = trunkBox.max.x - trunkBox.min.x
+  const sz = trunkBox.max.z - trunkBox.min.z
+  anchor.x = trunkBox.min.x + sx * 0.5
+  const rawY = trunkBox.max.y - size.y * 0.008
+  const deckMinY = overall.min.y + size.y * 0.52
+  const deckMaxY = overall.min.y + size.y * 0.72
+  anchor.y = THREE.MathUtils.clamp(rawY, deckMinY, deckMaxY)
+  anchor.z = trunkBox.min.z + sz * 0.55
+  return anchor
+}
+
+function UniversalSpoilerModel({ carRoot }: { carRoot: THREE.Object3D }) {
+  const gltf = useGLTF(SPOILER_UNIVERSAL_URL)
+  const { carBox, trunkAnchor } = useMemo(() => {
+    const box = boundingBoxRootLocal(carRoot)
+    return { carBox: box, trunkAnchor: computeTrunkAnchor(carRoot, box) }
+  }, [carRoot])
+
+  const part = useMemo(() => {
+    const r = cloneMergedGltfScene(gltf)
+    prepareGlbMesh(r)
+    const sBox = boundingBoxRootLocal(r)
+    const sSize = sBox.getSize(new THREE.Vector3())
+    const spMax = Math.max(sSize.x, sSize.y, sSize.z, 1e-6)
+    const cSize = carBox.getSize(new THREE.Vector3())
+    const carSpan = Math.max(cSize.x, cSize.y, cSize.z, 1e-6)
+    // Same parent scale applies to car and spoiler; match spoiler span to car width (~38%)
+    const targetSpan = carSpan * 0.38
+    r.scale.setScalar(targetSpan / spMax)
+    // Pivot is not at the feet; raise geometry so the bbox bottom sits on y=0 in part space
+    // before parent rotations (stops the wing from ending up under the car).
+    const after = boundingBoxRootLocal(r)
+    r.position.y -= after.min.y
+    return r
+  }, [gltf, carBox])
+
+  const pos = useMemo(
+    () => [trunkAnchor.x, trunkAnchor.y, trunkAnchor.z] as const,
+    [trunkAnchor],
+  )
+
   return (
-    <group position={[0, 0.05, 0]}>
-      {flags.spoiler && (
-        <mesh position={[0.15, 0.42, -0.95]} rotation={[0.08, 0, 0]}>
-          <boxGeometry args={[1.05, 0.06, 0.22]} />
-          {carbon}
-        </mesh>
+    <group position={pos}>
+      {/*
+        Sketchfab export: wing is mostly in XY (vertical in world). Lay it flat on the trunk:
+        -90° X maps local +Y (span) toward horizontal; +90° Z aligns span with car width.
+      */}
+      <group rotation={[-Math.PI / 2, 0, Math.PI / 2]}>
+        <group rotation={[0.1, 0, 0]}>
+          <primitive object={part} />
+        </group>
+      </group>
+    </group>
+  )
+}
+
+function ModParts({
+  flags,
+  carRoot,
+}: {
+  flags: ModFlags
+  carRoot: THREE.Object3D
+}) {
+  return (
+    <group>
+      {flags.spoiler === 'universal-spoiler-2' && (
+        <UniversalSpoilerModel carRoot={carRoot} />
       )}
       {flags.frontLip && (
         <mesh position={[0.15, -0.28, 1.05]} rotation={[-0.12, 0, 0]}>
@@ -210,7 +412,7 @@ function ModParts({ flags }: { flags: ModFlags }) {
 function useNormalizedScale(object: THREE.Object3D | null) {
   return useMemo(() => {
     if (!object) return 1
-    const box = new THREE.Box3().setFromObject(object)
+    const box = boundingBoxRootLocal(object)
     const size = box.getSize(new THREE.Vector3())
     const max = Math.max(size.x, size.y, size.z)
     return max > 0 ? 2.4 / max : 1
@@ -225,6 +427,10 @@ function CarLoadedScene({ flags }: { flags: ModFlags }) {
     return r
   }, [gltf])
 
+  useEffect(() => {
+    useGLTF.preload(SPOILER_UNIVERSAL_URL)
+  }, [])
+
   const spin = useRef<THREE.Group>(null)
   const scale = useNormalizedScale(root)
 
@@ -234,9 +440,14 @@ function CarLoadedScene({ flags }: { flags: ModFlags }) {
 
   return (
     <group ref={spin} scale={[scale, scale, scale]}>
-      <Center top={false}>
+      {/*
+        `object={root}` makes Center use only the car bbox for alignment.
+        Otherwise drei's Center does not re-layout when the spoiler GLB mounts,
+        and the add-on stays off-screen / wrong.
+      */}
+      <Center top={false} object={root} cacheKey={flags.spoiler}>
         <primitive object={root} />
-        <ModParts flags={flags} />
+        <ModParts flags={flags} carRoot={root} />
       </Center>
     </group>
   )
@@ -285,3 +496,4 @@ export function BMWScene({ flags }: { flags: ModFlags }) {
 }
 
 useGLTF.preload(GLB_URL)
+useGLTF.preload(SPOILER_UNIVERSAL_URL)
